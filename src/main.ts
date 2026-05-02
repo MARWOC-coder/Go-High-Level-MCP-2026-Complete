@@ -164,6 +164,28 @@ async function main() {
     next();
   });
 
+  // Bearer-token auth gate. Active only when MCP_AUTH_TOKEN is set; absent token
+  // leaves the server publicly accessible (preserves prior behavior). /, /health,
+  // /capabilities stay open so Railway health checks and root probes keep working.
+  const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
+  const PUBLIC_PATHS = new Set(['/', '/health', '/capabilities']);
+  if (AUTH_TOKEN) {
+    log('info', 'Bearer-token auth enabled');
+    app.use((req, res, next) => {
+      if (req.method === 'OPTIONS' || PUBLIC_PATHS.has(req.path)) return next();
+      const header = req.headers.authorization || '';
+      const provided = header.startsWith('Bearer ') ? header.slice(7) : '';
+      if (provided !== AUTH_TOKEN) {
+        log('warn', 'Auth rejected', { path: req.path, ip: req.ip });
+        res.status(401).json({ error: 'Unauthorized' });
+        return;
+      }
+      next();
+    });
+  } else {
+    log('warn', 'MCP_AUTH_TOKEN not set — server is publicly accessible');
+  }
+
   // ── 5. Streamable HTTP Endpoint ──────────────────────────
   // Stateless mode: create a fresh transport per request so each
   // client can do its own initialize → tools/list → tools/call lifecycle.
