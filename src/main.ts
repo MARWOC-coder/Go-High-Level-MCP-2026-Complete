@@ -261,6 +261,11 @@ async function main() {
       }
 
       const server = createFreshServer(perRequestClient);
+      // CRITICAL: connect server to transport BEFORE handleRequest so the
+      // McpServer's request handlers are wired up. Without this, the transport
+      // parses the incoming JSON-RPC message but has nothing to dispatch it
+      // to, so the response stream stays empty and the client hangs.
+      await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
       // Clean up after the response finishes
       res.on('close', () => {
@@ -275,24 +280,31 @@ async function main() {
   });
 
   // ── 6. Legacy SSE Endpoint ───────────────────────────────
-  // Keep SSE for backward compatibility with older clients
-  const handleSSE = async (req: express.Request, res: express.Response) => {
-    const sessionId = req.query.sessionId || 'unknown';
-    log('info', 'SSE connection', { sessionId: String(sessionId) });
+  // The legacy MCP SSE transport is two-leg:
+  //   GET  /sse              → server opens a long-lived SSE stream and
+  //                            immediately sends `event: endpoint` with a URL
+  //                            the client should POST messages to (carrying
+  //                            the sessionId allocated for this transport).
+  //   POST /sse?sessionId=X  → routed to the *existing* transport for X via
+  //                            transport.handlePostMessage(); the JSON-RPC
+  //                            response is then written back through the
+  //                            already-open SSE stream.
+  // The previous implementation routed BOTH verbs through the same handler,
+  // which created a brand-new transport on every POST and orphaned the
+  // client's original SSE stream waiting for a response that never came.
 
+  const sseTransports = new Map<string, SSEServerTransport>();
+
+  app.get('/sse', async (req, res) => {
     try {
-      // Create a fresh McpServer + SSE transport per connection
-      // because SSE transport is stateful (one connection = one transport)
       const sseServer = new McpServer(
         { name: 'ghl-mcp-server', version: '2.0.0' },
         { capabilities: { tools: {} } }
       );
 
-      // Re-register all tools for this SSE session
       const sseRegistry = new ToolRegistry(ghlClient);
       sseRegistry.registerAll(sseServer);
 
-      // Register app tools (skip duplicates)
       const sseRegisteredNames = new Set(sseRegistry.getAllToolNames());
       for (const tool of appTools) {
         if (sseRegisteredNames.has(tool.name)) continue;
@@ -328,23 +340,46 @@ async function main() {
       }
 
       const transport = new SSEServerTransport('/sse', res);
-      await sseServer.connect(transport);
+      sseTransports.set(transport.sessionId, transport);
+      log('info', 'SSE connection opened', { sessionId: transport.sessionId });
 
-      req.on('close', () => {
-        log('info', 'SSE connection closed', { sessionId: String(sessionId) });
-      });
+      const cleanup = () => {
+        if (sseTransports.delete(transport.sessionId)) {
+          log('info', 'SSE connection closed', { sessionId: transport.sessionId });
+          sseServer.close().catch(() => {});
+        }
+      };
+      req.on('close', cleanup);
+      res.on('close', cleanup);
+
+      await sseServer.connect(transport);
     } catch (err: any) {
-      log('error', 'SSE error', { error: err.message, sessionId: String(sessionId) });
+      log('error', 'SSE GET error', { error: err.message });
       if (!res.headersSent) {
         res.status(500).json({ error: 'Failed to establish SSE connection' });
       } else {
         res.end();
       }
     }
-  };
+  });
 
-  app.get('/sse', handleSSE);
-  app.post('/sse', handleSSE);
+  app.post('/sse', async (req, res) => {
+    const sessionId = String(req.query.sessionId || '');
+    const transport = sseTransports.get(sessionId);
+    if (!transport) {
+      log('warn', 'SSE POST for unknown session', { sessionId });
+      res.status(404).json({ error: 'Unknown sessionId. Open GET /sse first.' });
+      return;
+    }
+    try {
+      await transport.handlePostMessage(req, res, req.body);
+    } catch (err: any) {
+      log('error', 'SSE POST error', { error: err.message, sessionId });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to handle SSE message' });
+      }
+    }
+  });
 
   // ── 7. REST Endpoints ────────────────────────────────────
 
