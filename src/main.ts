@@ -176,17 +176,7 @@ async function main() {
       const header = req.headers.authorization || '';
       const provided = header.startsWith('Bearer ') ? header.slice(7) : '';
       if (provided !== AUTH_TOKEN) {
-        const headerSummary = header
-          ? `present (len=${header.length}, first10=${JSON.stringify(header.slice(0, 10))})`
-          : 'absent';
-        log('warn', 'Auth rejected', {
-          path: req.path,
-          ip: req.ip,
-          method: req.method,
-          userAgent: req.headers['user-agent'] || 'none',
-          authHeader: headerSummary,
-          allHeaderKeys: Object.keys(req.headers),
-        });
+        log('warn', 'Auth rejected', { path: req.path, ip: req.ip });
         res.status(401).json({ error: 'Unauthorized' });
         return;
       }
